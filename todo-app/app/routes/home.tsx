@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from "react";
-import { useFetcher, useOutletContext } from "react-router";
+import { useFetcher } from "react-router";
 import type { Route } from "./+types/home";
 import {
   getAllTodos,
   addTodo,
   updateTodo,
   deleteTodo,
+  restoreTodo,
   reorderTodos,
   clearCompleted,
   type Todo,
@@ -32,6 +33,77 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { toast } from "sonner";
 
+/* ─── Due-date helpers ─── */
+
+function getDueDateInfo(
+  dueDate: string | null,
+  completed: boolean
+): { label: string; className: string; icon: "overdue" | "today" | "soon" | "later" | "done" } | null {
+  if (!dueDate) return null;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const due = new Date(dueDate + "T00:00:00");
+  const diffDays = Math.round(
+    (due.getTime() - today.getTime()) / 86_400_000
+  );
+
+  if (completed) {
+    return {
+      label: formatShortDate(due),
+      className:
+        "text-gray-400 bg-gray-100 dark:bg-gray-700/50 dark:text-gray-500",
+      icon: "done",
+    };
+  }
+
+  if (diffDays < 0) {
+    const abs = Math.abs(diffDays);
+    return {
+      label: abs === 1 ? "Yesterday" : `${abs}d overdue`,
+      className:
+        "text-red-600 bg-red-50 dark:bg-red-500/15 dark:text-red-400 font-semibold",
+      icon: "overdue",
+    };
+  }
+  if (diffDays === 0) {
+    return {
+      label: "Due today",
+      className:
+        "text-amber-600 bg-amber-50 dark:bg-amber-500/15 dark:text-amber-400 font-semibold",
+      icon: "today",
+    };
+  }
+  if (diffDays === 1) {
+    return {
+      label: "Tomorrow",
+      className:
+        "text-blue-600 bg-blue-50 dark:bg-blue-500/15 dark:text-blue-400",
+      icon: "soon",
+    };
+  }
+  if (diffDays <= 7) {
+    return {
+      label: `In ${diffDays} days`,
+      className:
+        "text-blue-600 bg-blue-50 dark:bg-blue-500/15 dark:text-blue-400",
+      icon: "soon",
+    };
+  }
+  return {
+    label: formatShortDate(due),
+    className:
+      "text-gray-500 bg-gray-100 dark:bg-gray-700/50 dark:text-gray-400",
+    icon: "later",
+  };
+}
+
+function formatShortDate(d: Date): string {
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+/* ─── Route meta / loader / action ─── */
+
 export function meta({}: Route.MetaArgs) {
   return [
     { title: "Todo App — Remix" },
@@ -56,7 +128,8 @@ export async function action({ request }: Route.ActionArgs) {
     case "add": {
       const text = (formData.get("text") as string)?.trim();
       if (!text) return { ok: false, message: "Task text cannot be empty" };
-      addTodo(text);
+      const dueDate = (formData.get("dueDate") as string) || null;
+      addTodo(text, dueDate);
       return { ok: true, message: "Task added", intent };
     }
     case "toggle": {
@@ -73,13 +146,20 @@ export async function action({ request }: Route.ActionArgs) {
       const id = formData.get("id") as string;
       const text = (formData.get("text") as string)?.trim();
       if (!text) return { ok: false, message: "Task text cannot be empty" };
-      updateTodo(id, { text });
+      const rawDue = formData.get("dueDate") as string | null;
+      const dueDate = rawDue === "__clear__" ? null : rawDue || undefined;
+      updateTodo(id, { text, ...(dueDate !== undefined && { dueDate }) });
       return { ok: true, message: "Task updated", intent };
     }
     case "delete": {
       const id = formData.get("id") as string;
       deleteTodo(id);
       return { ok: true, message: "Task deleted", intent };
+    }
+    case "restore": {
+      const todoData: Todo = JSON.parse(formData.get("todoData") as string);
+      restoreTodo(todoData);
+      return { ok: true, message: "Task restored", intent };
     }
     case "reorder": {
       const orderedIds = JSON.parse(formData.get("orderedIds") as string);
@@ -106,6 +186,8 @@ export async function action({ request }: Route.ActionArgs) {
   }
 }
 
+/* ─── Main component ─── */
+
 type Filter = "all" | "active" | "completed";
 
 export default function Home({ loaderData }: Route.ComponentProps) {
@@ -121,6 +203,8 @@ export default function Home({ loaderData }: Route.ComponentProps) {
   const reorderFetcher = useFetcher();
   const themeFetcher = useFetcher();
   const clearFetcher = useFetcher();
+  const deleteFetcher = useFetcher();
+  const restoreFetcher = useFetcher();
 
   useEffect(() => {
     setTodos(serverTodos);
@@ -180,6 +264,9 @@ export default function Home({ loaderData }: Route.ComponentProps) {
 
   const activeCount = todos.filter((t) => !t.completed).length;
   const completedCount = todos.filter((t) => t.completed).length;
+  const overdueCount = todos.filter(
+    (t) => !t.completed && t.dueDate && getDueDateInfo(t.dueDate, false)?.icon === "overdue"
+  ).length;
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -217,15 +304,41 @@ export default function Home({ loaderData }: Route.ComponentProps) {
   function handleAdd(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const form = e.currentTarget;
-    const text = new FormData(form).get("text") as string;
-    if (!text?.trim()) return;
+    const fd = new FormData(form);
+    const text = (fd.get("text") as string)?.trim();
+    if (!text) return;
 
     addFetcher.submit(
-      { intent: "add", text: text.trim() },
+      {
+        intent: "add",
+        text,
+        dueDate: (fd.get("dueDate") as string) || "",
+      },
       { method: "post" }
     );
     form.reset();
     toast.success("Task added");
+  }
+
+  function handleDeleteTodo(todo: Todo) {
+    deleteFetcher.submit(
+      { intent: "delete", id: todo.id },
+      { method: "post" }
+    );
+
+    toast("Task deleted", {
+      duration: 5000,
+      action: {
+        label: "Undo",
+        onClick: () => {
+          restoreFetcher.submit(
+            { intent: "restore", todoData: JSON.stringify(todo) },
+            { method: "post" }
+          );
+          toast.success("Task restored");
+        },
+      },
+    });
   }
 
   function handleToggleTheme() {
@@ -262,6 +375,11 @@ export default function Home({ loaderData }: Route.ComponentProps) {
             </h1>
             <p className="mt-1.5 text-sm text-gray-500 dark:text-gray-400">
               {activeCount} task{activeCount !== 1 ? "s" : ""} remaining
+              {overdueCount > 0 && (
+                <span className="ml-2 text-red-500 dark:text-red-400 font-medium">
+                  · {overdueCount} overdue
+                </span>
+              )}
             </p>
           </div>
           <div className="flex items-center gap-1">
@@ -293,32 +411,12 @@ export default function Home({ loaderData }: Route.ComponentProps) {
               aria-label="Toggle theme"
             >
               {theme === "dark" ? (
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="20"
-                  height="20"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="12" r="4" />
                   <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
                 </svg>
               ) : (
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="20"
-                  height="20"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
                 </svg>
               )}
@@ -332,35 +430,39 @@ export default function Home({ loaderData }: Route.ComponentProps) {
         {/* Add form */}
         <form
           onSubmit={handleAdd}
-          className="mb-6 flex gap-2 bg-white dark:bg-gray-800/80 backdrop-blur-sm rounded-2xl shadow-lg shadow-gray-200/50 dark:shadow-black/20 border border-gray-200/60 dark:border-gray-700/50 p-2"
+          className="mb-6 bg-white dark:bg-gray-800/80 backdrop-blur-sm rounded-2xl shadow-lg shadow-gray-200/50 dark:shadow-black/20 border border-gray-200/60 dark:border-gray-700/50 p-2"
         >
-          <input
-            ref={inputRef}
-            type="text"
-            name="text"
-            placeholder="What needs to be done?"
-            className="flex-1 bg-transparent px-4 py-3 text-sm placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none"
-            autoComplete="off"
-          />
-          <button
-            type="submit"
-            className="px-5 py-2.5 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white rounded-xl font-medium text-sm transition-all hover:shadow-lg hover:shadow-indigo-500/25 active:scale-[0.97] flex items-center gap-1.5"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M5 12h14M12 5v14" />
-            </svg>
-            <span className="hidden sm:inline">Add Task</span>
-          </button>
+          <div className="flex gap-2">
+            <input
+              ref={inputRef}
+              type="text"
+              name="text"
+              placeholder="What needs to be done?"
+              className="flex-1 bg-transparent px-4 py-3 text-sm placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none min-w-0"
+              autoComplete="off"
+            />
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <label className="relative group cursor-pointer" title="Set due date">
+                <input
+                  type="date"
+                  name="dueDate"
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                />
+                <div className="p-2.5 rounded-xl text-gray-400 group-hover:text-indigo-500 group-hover:bg-indigo-50 dark:group-hover:bg-indigo-500/10 transition-all">
+                  <CalendarIcon size={18} />
+                </div>
+              </label>
+              <button
+                type="submit"
+                className="px-5 py-2.5 bg-gradient-to-r from-indigo-500 to-purple-500 hover:from-indigo-600 hover:to-purple-600 text-white rounded-xl font-medium text-sm transition-all hover:shadow-lg hover:shadow-indigo-500/25 active:scale-[0.97] flex items-center gap-1.5"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M5 12h14M12 5v14" />
+                </svg>
+                <span className="hidden sm:inline">Add Task</span>
+              </button>
+            </div>
+          </div>
         </form>
 
         {/* Filters */}
@@ -421,6 +523,7 @@ export default function Home({ loaderData }: Route.ComponentProps) {
                       isEditing={editingId === todo.id}
                       onStartEdit={() => setEditingId(todo.id)}
                       onCancelEdit={() => setEditingId(null)}
+                      onDelete={handleDeleteTodo}
                     />
                   ))}
                 </ul>
@@ -482,11 +585,13 @@ function SortableTodoItem({
   isEditing,
   onStartEdit,
   onCancelEdit,
+  onDelete,
 }: {
   todo: Todo;
   isEditing: boolean;
   onStartEdit: () => void;
   onCancelEdit: () => void;
+  onDelete: (todo: Todo) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: todo.id });
@@ -499,16 +604,18 @@ function SortableTodoItem({
   const fetcher = useFetcher();
   const editInputRef = useRef<HTMLInputElement>(null);
   const [editText, setEditText] = useState(todo.text);
+  const [editDueDate, setEditDueDate] = useState(todo.dueDate ?? "");
 
   useEffect(() => {
     if (isEditing) {
       setEditText(todo.text);
+      setEditDueDate(todo.dueDate ?? "");
       requestAnimationFrame(() => {
         editInputRef.current?.focus();
         editInputRef.current?.select();
       });
     }
-  }, [isEditing, todo.text]);
+  }, [isEditing, todo.text, todo.dueDate]);
 
   function handleToggle() {
     fetcher.submit(
@@ -518,19 +625,25 @@ function SortableTodoItem({
     toast.success(!todo.completed ? "Task completed!" : "Task marked active");
   }
 
-  function handleDelete() {
-    fetcher.submit({ intent: "delete", id: todo.id }, { method: "post" });
-    toast.success("Task deleted");
-  }
-
   function handleEditSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!editText.trim() || editText.trim() === todo.text) {
+    if (!editText.trim()) {
+      onCancelEdit();
+      return;
+    }
+    const hasTextChange = editText.trim() !== todo.text;
+    const hasDateChange = (editDueDate || null) !== (todo.dueDate || null);
+    if (!hasTextChange && !hasDateChange) {
       onCancelEdit();
       return;
     }
     fetcher.submit(
-      { intent: "edit", id: todo.id, text: editText.trim() },
+      {
+        intent: "edit",
+        id: todo.id,
+        text: editText.trim(),
+        dueDate: editDueDate || "__clear__",
+      },
       { method: "post" }
     );
     toast.success("Task updated");
@@ -544,6 +657,8 @@ function SortableTodoItem({
   const displayCompleted = isOptimisticallyToggled
     ? fetcher.formData?.get("completed") === "true"
     : todo.completed;
+
+  const dueDateInfo = getDueDateInfo(todo.dueDate, displayCompleted);
 
   return (
     <li
@@ -561,19 +676,9 @@ function SortableTodoItem({
         aria-label="Drag to reorder"
         tabIndex={-1}
       >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="currentColor"
-        >
-          <circle cx="9" cy="5" r="1.5" />
-          <circle cx="9" cy="12" r="1.5" />
-          <circle cx="9" cy="19" r="1.5" />
-          <circle cx="15" cy="5" r="1.5" />
-          <circle cx="15" cy="12" r="1.5" />
-          <circle cx="15" cy="19" r="1.5" />
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+          <circle cx="9" cy="5" r="1.5" /><circle cx="9" cy="12" r="1.5" /><circle cx="9" cy="19" r="1.5" />
+          <circle cx="15" cy="5" r="1.5" /><circle cx="15" cy="12" r="1.5" /><circle cx="15" cy="19" r="1.5" />
         </svg>
       </button>
 
@@ -587,21 +692,13 @@ function SortableTodoItem({
           className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-all duration-200 ${
             displayCompleted
               ? "bg-emerald-500 border-emerald-500 animate-check-pop"
-              : "border-gray-300 dark:border-gray-600 hover:border-indigo-400 dark:hover:border-indigo-500"
+              : dueDateInfo?.icon === "overdue"
+                ? "border-red-400 dark:border-red-500 hover:border-red-500"
+                : "border-gray-300 dark:border-gray-600 hover:border-indigo-400 dark:hover:border-indigo-500"
           }`}
         >
           {displayCompleted && (
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="11"
-              height="11"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="white"
-              strokeWidth="3.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
+            <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="20 6 9 17 4 12" />
             </svg>
           )}
@@ -610,66 +707,66 @@ function SortableTodoItem({
 
       {/* Text / Edit */}
       {isEditing ? (
-        <form onSubmit={handleEditSubmit} className="flex-1 flex gap-2">
-          <input
-            ref={editInputRef}
-            type="text"
-            value={editText}
-            onChange={(e) => setEditText(e.target.value)}
-            onKeyDown={(e) => e.key === "Escape" && onCancelEdit()}
-            className="flex-1 bg-white dark:bg-gray-700 border border-indigo-300 dark:border-indigo-500/50 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-shadow"
-          />
-          <button
-            type="submit"
-            className="p-1.5 text-emerald-500 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-500/10 rounded-lg transition-all"
-            aria-label="Save"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+        <form onSubmit={handleEditSubmit} className="flex-1 flex flex-col sm:flex-row gap-2">
+          <div className="flex gap-2 flex-1 min-w-0">
+            <input
+              ref={editInputRef}
+              type="text"
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              onKeyDown={(e) => e.key === "Escape" && onCancelEdit()}
+              className="flex-1 bg-white dark:bg-gray-700 border border-indigo-300 dark:border-indigo-500/50 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-shadow min-w-0"
+            />
+            <input
+              type="date"
+              value={editDueDate}
+              onChange={(e) => setEditDueDate(e.target.value)}
+              className="bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500/40 transition-shadow w-[130px] flex-shrink-0 text-gray-600 dark:text-gray-300"
+            />
+          </div>
+          <div className="flex gap-1 flex-shrink-0">
+            <button
+              type="submit"
+              className="p-1.5 text-emerald-500 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-500/10 rounded-lg transition-all"
+              aria-label="Save"
             >
-              <polyline points="20 6 9 17 4 12" />
-            </svg>
-          </button>
-          <button
-            type="button"
-            onClick={onCancelEdit}
-            className="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-all"
-            aria-label="Cancel"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={onCancelEdit}
+              className="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-all"
+              aria-label="Cancel"
             >
-              <path d="M18 6 6 18M6 6l12 12" />
-            </svg>
-          </button>
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
         </form>
       ) : (
-        <span
-          onDoubleClick={onStartEdit}
-          className={`flex-1 text-sm cursor-default select-none transition-all duration-200 leading-relaxed ${
-            displayCompleted
-              ? "line-through text-gray-400 dark:text-gray-500"
-              : "text-gray-700 dark:text-gray-200"
-          }`}
-        >
-          {todo.text}
-        </span>
+        <div className="flex-1 min-w-0">
+          <span
+            onDoubleClick={onStartEdit}
+            className={`block text-sm cursor-default select-none transition-all duration-200 leading-relaxed ${
+              displayCompleted
+                ? "line-through text-gray-400 dark:text-gray-500"
+                : "text-gray-700 dark:text-gray-200"
+            }`}
+          >
+            {todo.text}
+          </span>
+          {dueDateInfo && (
+            <span
+              className={`inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-md text-[10px] leading-tight ${dueDateInfo.className}`}
+            >
+              <CalendarIcon size={10} />
+              {dueDateInfo.label}
+            </span>
+          )}
+        </div>
       )}
 
       {/* Actions */}
@@ -680,36 +777,16 @@ function SortableTodoItem({
             className="p-1.5 rounded-lg text-gray-400 hover:text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-all"
             aria-label="Edit task"
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
             </svg>
           </button>
           <button
-            onClick={handleDelete}
+            onClick={() => onDelete(todo)}
             className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 transition-all"
             aria-label="Delete task"
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
             </svg>
           </button>
@@ -722,22 +799,13 @@ function SortableTodoItem({
 /* ─── Drag Overlay ─── */
 
 function TodoItemOverlay({ todo }: { todo: Todo }) {
+  const dueDateInfo = getDueDateInfo(todo.dueDate, todo.completed);
   return (
     <div className="flex items-center gap-3 px-4 py-3 bg-white dark:bg-gray-800 rounded-2xl shadow-2xl shadow-indigo-500/10 border border-indigo-200 dark:border-indigo-500/30 ring-2 ring-indigo-500/20">
       <div className="text-gray-300 dark:text-gray-600">
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="currentColor"
-        >
-          <circle cx="9" cy="5" r="1.5" />
-          <circle cx="9" cy="12" r="1.5" />
-          <circle cx="9" cy="19" r="1.5" />
-          <circle cx="15" cy="5" r="1.5" />
-          <circle cx="15" cy="12" r="1.5" />
-          <circle cx="15" cy="19" r="1.5" />
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+          <circle cx="9" cy="5" r="1.5" /><circle cx="9" cy="12" r="1.5" /><circle cx="9" cy="19" r="1.5" />
+          <circle cx="15" cy="5" r="1.5" /><circle cx="15" cy="12" r="1.5" /><circle cx="15" cy="19" r="1.5" />
         </svg>
       </div>
       <div
@@ -748,31 +816,53 @@ function TodoItemOverlay({ todo }: { todo: Todo }) {
         }`}
       >
         {todo.completed && (
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            width="11"
-            height="11"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="white"
-            strokeWidth="3.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
+          <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
             <polyline points="20 6 9 17 4 12" />
           </svg>
         )}
       </div>
-      <span
-        className={`text-sm font-medium ${
-          todo.completed
-            ? "line-through text-gray-400"
-            : "text-gray-700 dark:text-gray-200"
-        }`}
-      >
-        {todo.text}
-      </span>
+      <div className="min-w-0">
+        <span
+          className={`text-sm font-medium ${
+            todo.completed
+              ? "line-through text-gray-400"
+              : "text-gray-700 dark:text-gray-200"
+          }`}
+        >
+          {todo.text}
+        </span>
+        {dueDateInfo && (
+          <span
+            className={`ml-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] ${dueDateInfo.className}`}
+          >
+            <CalendarIcon size={9} />
+            {dueDateInfo.label}
+          </span>
+        )}
+      </div>
     </div>
+  );
+}
+
+/* ─── Shared Icons ─── */
+
+function CalendarIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M8 2v4M16 2v4" />
+      <rect width="18" height="18" x="3" y="4" rx="2" />
+      <path d="M3 10h18" />
+    </svg>
   );
 }
 
@@ -807,17 +897,7 @@ function ShortcutsModal({ onClose }: { onClose: () => void }) {
             onClick={onClose}
             className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700"
           >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M18 6 6 18M6 6l12 12" />
             </svg>
           </button>

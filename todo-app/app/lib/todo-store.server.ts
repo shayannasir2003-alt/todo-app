@@ -3,6 +3,7 @@ export interface Todo {
   text: string;
   completed: boolean;
   order: number;
+  dueDate: string | null;
   createdAt: string;
 }
 
@@ -12,13 +13,20 @@ declare global {
 
 if (!globalThis.__todoStore) {
   globalThis.__todoStore = new Map<string, Todo>();
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const dayMs = 86_400_000;
+  const toDateStr = (d: Date) => d.toISOString().split("T")[0];
+
   const samples = [
-    { text: "Build a beautiful todo app with Remix", completed: true },
-    { text: "Add drag-and-drop reordering", completed: false },
-    { text: "Implement dark mode toggle", completed: false },
-    { text: "Set up keyboard shortcuts", completed: false },
-    { text: "Make it fully responsive", completed: false },
+    { text: "Build a beautiful todo app with Remix", completed: true, dueDate: null },
+    { text: "Add drag-and-drop reordering", completed: false, dueDate: toDateStr(new Date(today.getTime() - dayMs)) },
+    { text: "Implement dark mode toggle", completed: false, dueDate: toDateStr(today) },
+    { text: "Set up keyboard shortcuts", completed: false, dueDate: toDateStr(new Date(today.getTime() + dayMs)) },
+    { text: "Make it fully responsive", completed: false, dueDate: toDateStr(new Date(today.getTime() + 5 * dayMs)) },
   ];
+
   samples.forEach((s, i) => {
     const id = crypto.randomUUID();
     globalThis.__todoStore!.set(id, {
@@ -26,6 +34,7 @@ if (!globalThis.__todoStore) {
       text: s.text,
       completed: s.completed,
       order: i,
+      dueDate: s.dueDate,
       createdAt: new Date(
         Date.now() - (samples.length - i) * 60000
       ).toISOString(),
@@ -39,7 +48,7 @@ export function getAllTodos(): Todo[] {
   return Array.from(store.values()).sort((a, b) => a.order - b.order);
 }
 
-export function addTodo(text: string): Todo {
+export function addTodo(text: string, dueDate: string | null = null): Todo {
   const id = crypto.randomUUID();
   const todos = getAllTodos();
   const maxOrder =
@@ -49,6 +58,7 @@ export function addTodo(text: string): Todo {
     text,
     completed: false,
     order: maxOrder,
+    dueDate,
     createdAt: new Date().toISOString(),
   };
   store.set(id, todo);
@@ -57,7 +67,7 @@ export function addTodo(text: string): Todo {
 
 export function updateTodo(
   id: string,
-  updates: Partial<Pick<Todo, "text" | "completed">>
+  updates: Partial<Pick<Todo, "text" | "completed" | "dueDate">>
 ): Todo | null {
   const todo = store.get(id);
   if (!todo) return null;
@@ -66,8 +76,14 @@ export function updateTodo(
   return updated;
 }
 
-export function deleteTodo(id: string): boolean {
-  return store.delete(id);
+export function deleteTodo(id: string): Todo | null {
+  const todo = store.get(id) ?? null;
+  store.delete(id);
+  return todo;
+}
+
+export function restoreTodo(todo: Todo): void {
+  store.set(todo.id, todo);
 }
 
 export function reorderTodos(orderedIds: string[]): void {
